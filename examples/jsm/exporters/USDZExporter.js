@@ -62,7 +62,7 @@ class USDZExporter {
 			const color = id.split( '_' )[ 1 ];
 			const isRGBA = texture.format === 1023;
 
-			const canvas = imageToCanvas( texture.image, color );
+			const canvas = textureToCanvas( texture, color );
 			const blob = await new Promise( resolve => canvas.toBlob( resolve, isRGBA ? 'image/png' : 'image/jpeg', 1 ) );
 
 			files[ `textures/Texture_${ id }.${ isRGBA ? 'png' : 'jpg' }` ] = new Uint8Array( await blob.arrayBuffer() );
@@ -102,18 +102,18 @@ class USDZExporter {
 
 }
 
-function imageToCanvas( image, color ) {
+function textureToCanvas( texture, color ) {
+	const image = texture.image;
+
+	const scale = 1024 / Math.max( image.width, image.height );
+	const canvas = document.createElement( 'canvas' );
+	canvas.width = image.width * Math.min( 1, scale );
+	canvas.height = image.height * Math.min( 1, scale );
 
 	if ( ( typeof HTMLImageElement !== 'undefined' && image instanceof HTMLImageElement ) ||
 		( typeof HTMLCanvasElement !== 'undefined' && image instanceof HTMLCanvasElement ) ||
 		( typeof OffscreenCanvas !== 'undefined' && image instanceof OffscreenCanvas ) ||
 		( typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap ) ) {
-
-		const scale = 1024 / Math.max( image.width, image.height );
-
-		const canvas = document.createElement( 'canvas' );
-		canvas.width = image.width * Math.min( 1, scale );
-		canvas.height = image.height * Math.min( 1, scale );
 
 		const context = canvas.getContext( '2d' );
 		context.drawImage( image, 0, 0, canvas.width, canvas.height );
@@ -138,13 +138,113 @@ function imageToCanvas( image, color ) {
 			}
 
 			context.putImageData( imagedata, 0, 0 );
-
 		}
 
-		return canvas;
+	} else {
+		const gl = canvas.getContext( 'webgl' );
 
+		var vertShaderSource = [
+				'precision highp float;',
+				'attribute vec2 position;',
+				'varying vec2 texCoord;',
+				'void main( void ) {',
+				'	texCoord = ( position * vec2( 1.0, -1.0 ) + vec2( 1.0, 1.0 ) ) * 0.5;',
+				'	gl_Position = vec4( position, 0.0, 1.0 );',
+				'}'
+		].join( '\n' );
+
+		const vertShader = gl.createShader( gl.VERTEX_SHADER );
+		gl.shaderSource( vertShader, vertShaderSource );
+		gl.compileShader( vertShader );
+		if ( !gl.getShaderParameter( vertShader, gl.COMPILE_STATUS ) ) {
+			console.log( gl.getShaderInfoLog( vertShader ) );
+			return;
+		}
+
+		const fragShaderSource = [
+				'precision highp float;',
+				'varying vec2 texCoord;',
+				'uniform sampler2D tex;',
+				'uniform lowp vec4 color;',
+				'void main( void ) {',
+				'	gl_FragColor = texture2D( tex, texCoord ) * color;',
+				'}'
+		].join( '\n' );
+
+		const fragShader = gl.createShader( gl.FRAGMENT_SHADER );
+		gl.shaderSource( fragShader, fragShaderSource );
+		gl.compileShader( fragShader );
+		if ( !gl.getShaderParameter( fragShader, gl.COMPILE_STATUS ) ) {
+			console.log( gl.getShaderInfoLog( fragShader ) );
+			return;
+		}
+
+		const shaderProgram = gl.createProgram();
+		gl.attachShader( shaderProgram, vertShader );
+		gl.attachShader( shaderProgram, fragShader );
+		gl.linkProgram( shaderProgram );
+
+		if ( !gl.getProgramParameter( shaderProgram, gl.LINK_STATUS ) ) {
+			console.log( 'Could not initialise shaders');
+			return;
+		}
+
+		gl.useProgram( shaderProgram );
+
+		const vertexPositionAttribute = gl.getAttribLocation( shaderProgram, 'position' );
+		gl.enableVertexAttribArray( vertexPositionAttribute );
+
+		const triangleVertexPositionBuffer = gl.createBuffer();
+		gl.bindBuffer( gl.ARRAY_BUFFER, triangleVertexPositionBuffer );
+		const vertices = [
+				-1.0, -1.0,
+				3.0, -1.0,
+				-1.0, 3.0,
+		];
+		gl.bufferData( gl.ARRAY_BUFFER, new Float32Array( vertices ), gl.STATIC_DRAW );
+
+		const tex = gl.createTexture();
+		gl.bindTexture( gl.TEXTURE_2D, tex );
+		gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR );
+		gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR );
+		// We don't care exactly which compression types are available,
+		// because `texture.format` is guaranteed to be one of them,
+		// BUT we still need to trigger the extension loading via `gl.getExtension`!
+		[
+			'WEBGL_compressed_texture_s3tc',
+			'WEBGL_compressed_texture_s3tc_srgb',
+			'WEBGL_compressed_texture_etc',
+			'WEBGL_compressed_texture_pvrtc',
+			'WEBGL_compressed_texture_etc1',
+			'WEBGL_compressed_texture_astc',
+			'EXT_texture_compression_bptc',
+			'EXT_texture_compression_rgtc',
+		].forEach( e => gl.getExtension( e ) );
+		gl.compressedTexImage2D( gl.TEXTURE_2D, 0, texture.format, image.width, image.height, 0, texture.mipmaps[ 0 ].data );
+
+		gl.clearColor( 0.0, 0.0, 0.0, 1.0 );
+		gl.disable( gl.DEPTH_TEST );
+		gl.viewport( 0, 0, canvas.width, canvas.height );
+		gl.activeTexture( gl.TEXTURE0 );
+		gl.bindTexture( gl.TEXTURE_2D, tex );
+		gl.uniform1i( gl.getUniformLocation( shaderProgram, 'tex' ), 0 );
+
+		const colorUniform = gl.getUniformLocation( shaderProgram, 'color');
+		if ( color !== undefined ) {
+			const hex = parseInt( color, 16 );
+			const r = ( hex >> 16 & 255 ) / 255;
+			const g = ( hex >> 8 & 255 ) / 255;
+			const b = ( hex & 255 ) / 255;
+			gl.uniform4f( colorUniform, r, g, b, 1 );
+		} else {
+			gl.uniform4f( colorUniform, 1, 1, 1, 1 );
+		}
+		gl.bindBuffer( gl.ARRAY_BUFFER, triangleVertexPositionBuffer );
+		gl.vertexAttribPointer( vertexPositionAttribute, 2, gl.FLOAT, false, 0, 0 );
+		gl.drawArrays( gl.TRIANGLES, 0, 3 );
 	}
 
+	return canvas;
 }
 
 //
